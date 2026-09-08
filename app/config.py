@@ -9,7 +9,7 @@ load_dotenv()
 
 @dataclass(frozen=True)
 class Settings:
-    telegram_bot_token: str
+    bale_bot_token: str
     check_interval_seconds: int
     raja_headless: bool
     raja_base_url: str
@@ -18,15 +18,15 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
-        token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        token = os.getenv("BALE_BOT_TOKEN", "").strip()
         if not token:
-            raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
+            raise RuntimeError("BALE_BOT_TOKEN is not set.")
 
         interval = max(60, int(os.getenv("CHECK_INTERVAL_SECONDS", "60")))
         headless = os.getenv("RAJA_HEADLESS", "true").lower() in {"1", "true", "yes", "on"}
 
         return cls(
-            telegram_bot_token=token,
+            bale_bot_token=token,
             check_interval_seconds=interval,
             raja_headless=headless,
             raja_base_url=os.getenv("RAJA_BASE_URL", "https://www.raja.ir/").strip(),

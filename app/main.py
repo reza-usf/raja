@@ -7,7 +7,6 @@ import random
 import re
 import time
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -191,8 +190,28 @@ async def confirm_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         interval_seconds=settings.check_interval_seconds,
     )
     await q.message.reply_text(
-        f"✅ پایش #{watch_id} فعال شد. وضعیت همه تاریخ‌ها در یک پیام زنده به‌روزرسانی می‌شود و فقط تغییرات مهم اعلان جداگانه می‌گیرند.",
+        f"✅ پایش #{watch_id} فعال شد. وضعیت همه تاریخ‌ها در پیام Dashboard پایین به‌روزرسانی می‌شود.",
         reply_markup=main_menu(),
+    )
+
+    dates = [
+        format_jalali(day)
+        for day in iter_jalali_days(d["date_from"], d["date_to"])
+    ]
+    dashboard_text = render_dashboard(
+        watch_id=watch_id,
+        origin=d["origin"],
+        destination=d["destination"],
+        passengers=d["passengers"],
+        passenger_type_label=TYPE_LABELS[d["passenger_type"]],
+        dates=dates,
+        snapshots={},
+        errors={},
+        checked_at=datetime.now(),
+    )
+    dashboard_message = await q.message.reply_text(dashboard_text)
+    storage.set_dashboard_message_id(
+        watch_id, dashboard_message.message_id
     )
     context.user_data.pop("draft", None)
     return ConversationHandler.END
@@ -241,79 +260,55 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-async def _ensure_dashboard_message(
+def format_important_notification(watch: Watch, events) -> str:
+    lines = [
+        f"🔔 تغییر مهم در پایش #{watch.id}",
+        f"🚉 {watch.origin} → {watch.destination}",
+        "",
+    ]
+    for event in events[:12]:
+        lines.append(event.text)
+    if len(events) > 12:
+        lines.append(f"... و {len(events) - 12} تغییر مهم دیگر")
+    lines += ["", "Dashboard پایش هم با وضعیت جدید به‌روزرسانی شد."]
+    return "\n".join(lines)
+
+
+async def update_dashboard_message(
     app: Application,
     storage: Storage,
     watch: Watch,
     text: str,
-) -> int:
+):
     """
-    Return a reusable Dashboard message id.
-
-    Existing watches created before this version do not have one. In that case
-    the bot sends it once and stores its message_id. Normal refreshes edit this
-    same message and therefore do not create a new notification.
+    Ordinary cycles edit one existing message, which should not create a new
+    chat notification. If the old dashboard cannot be edited (deleted/too old),
+    send one replacement and remember its new message_id.
     """
     if watch.dashboard_message_id:
-        return watch.dashboard_message_id
+        try:
+            await app.bot.edit_message_text(
+                chat_id=watch.chat_id,
+                message_id=watch.dashboard_message_id,
+                text=text,
+            )
+            return
+        except Exception as exc:
+            # "message is not modified" can happen on APIs that ignore seconds
+            # or normalize text. It is harmless.
+            if "not modified" in str(exc).lower():
+                return
+            log.warning(
+                "Could not edit dashboard for watch %s; sending replacement: %s",
+                watch.id,
+                exc,
+            )
 
-    msg = await app.bot.send_message(
+    message = await app.bot.send_message(
         chat_id=watch.chat_id,
         text=text,
     )
-    storage.set_dashboard_message_id(watch.id, msg.message_id)
-    return msg.message_id
-
-
-async def _update_dashboard(
-    app: Application,
-    storage: Storage,
-    watch: Watch,
-    text: str,
-) -> int:
-    message_id = await _ensure_dashboard_message(
-        app, storage, watch, text
-    )
-
-    # If it was just created, it already contains the current text.
-    if not watch.dashboard_message_id:
-        return message_id
-
-    try:
-        await app.bot.edit_message_text(
-            chat_id=watch.chat_id,
-            message_id=message_id,
-            text=text,
-        )
-        return message_id
-    except Exception as exc:
-        msg = str(exc).lower()
-
-        # Some Bot API implementations reject a byte-for-byte identical edit.
-        # This is harmless.
-        if "message is not modified" in msg:
-            return message_id
-
-        # If the user deleted the dashboard or Bale can no longer edit it,
-        # create a fresh dashboard and remember the new message id.
-        log.warning(
-            "Dashboard edit failed for watch %s; creating a new dashboard: %s",
-            watch.id,
-            exc,
-        )
-        new_msg = await app.bot.send_message(
-            chat_id=watch.chat_id,
-            text=text,
-        )
-        storage.set_dashboard_message_id(watch.id, new_msg.message_id)
-        return new_msg.message_id
-
-
-def _iran_now() -> datetime:
-    try:
-        return datetime.now(ZoneInfo("Asia/Tehran"))
-    except Exception:
-        return datetime.now()
+    storage.set_dashboard_message_id(watch.id, message.message_id)
 
 
 async def check_one_watch(app: Application, watch: Watch):
@@ -322,7 +317,6 @@ async def check_one_watch(app: Application, watch: Watch):
 
     cycle_started_wall = time.time()
     cycle_started_mono = time.monotonic()
-
     dates = [
         format_jalali(day)
         for day in iter_jalali_days(watch.date_from, watch.date_to)
@@ -337,24 +331,27 @@ async def check_one_watch(app: Application, watch: Watch):
             passenger_type=watch.passenger_type,
         )
 
-        current_snapshots: dict[str, dict] = {}
-        important_events = []
+        current_snapshots = {
+            date: result.snapshot()
+            for date, result in results.items()
+        }
 
-        # Compare every successfully-read date with the last successful state.
-        for jalali_date, result in results.items():
-            current = result.snapshot()
-            previous = storage.get_date_snapshot(
-                watch.id, jalali_date
-            )
-            current_snapshots[jalali_date] = current
+        previous_snapshots = {
+            date: storage.get_date_snapshot(watch.id, date)
+            for date in dates
+        }
 
-            important_events.extend(
-                detect_important_events(
-                    jalali_date,
-                    previous,
-                    current,
-                )
+        events = []
+        event_dates: set[str] = set()
+        for date, snapshot in current_snapshots.items():
+            date_events = detect_important_events(
+                date,
+                previous_snapshots.get(date),
+                snapshot,
             )
+            if date_events:
+                events.extend(date_events)
+                event_dates.add(date)
 
         elapsed = time.monotonic() - cycle_started_mono
 
@@ -367,114 +364,117 @@ async def check_one_watch(app: Application, watch: Watch):
             dates=dates,
             snapshots=current_snapshots,
             errors=errors,
-            checked_at=_iran_now(),
+            checked_at=datetime.now(),
             scan_seconds=elapsed,
         )
 
-        # Ordinary status refresh: edit the same message, no new-message alert.
-        await _update_dashboard(
-            app,
-            storage,
-            watch,
-            dashboard_text,
-        )
-
-        # Important changes: send ONE new message for the whole cycle.
-        # This is the notification-producing path.
-        if important_events:
-            lines = [
-                f"🔔 تغییر مهم در پایش #{watch.id}",
-                f"🚉 {watch.origin} → {watch.destination}",
-                "",
-            ]
-            lines.extend(
-                f"• {event.text}"
-                for event in important_events[:12]
+        try:
+            await update_dashboard_message(
+                app,
+                storage,
+                watch,
+                dashboard_text,
             )
-            if len(important_events) > 12:
-                lines.append(
-                    f"• ... و {len(important_events) - 12} تغییر دیگر"
+        except Exception:
+            # Dashboard failure should not stop future Raja checks.
+            log.exception(
+                "Could not update dashboard for watch %s",
+                watch.id,
+            )
+
+        notification_sent = True
+        if events:
+            try:
+                await app.bot.send_message(
+                    chat_id=watch.chat_id,
+                    text=format_important_notification(watch, events),
+                )
+            except Exception:
+                notification_sent = False
+                log.exception(
+                    "Important notification failed for watch %s",
+                    watch.id,
                 )
 
-            await app.bot.send_message(
-                chat_id=watch.chat_id,
-                text="\n".join(lines),
-            )
-
-        # Commit snapshots only after Dashboard + important notification have
-        # completed successfully. If Bale temporarily fails, the next cycle can
-        # retry the important notification instead of silently losing it.
-        for jalali_date, current in current_snapshots.items():
+        # Commit successful Raja observations.
+        #
+        # If a date produced an important event but the notification failed,
+        # keep its previous snapshot. The same event will be retried next cycle.
+        for date, result in results.items():
+            if date in event_dates and not notification_sent:
+                continue
             storage.set_date_snapshot(
                 watch.id,
-                jalali_date,
-                current,
+                date,
+                result.snapshot(),
+                result.fingerprint,
             )
 
         if results:
             storage.clear_errors(watch.id)
-
-        if errors:
-            log.warning(
-                "Watch %s: %s successful dates, %s failed dates (%s)",
-                watch.id,
-                len(results),
-                len(errors),
-                ", ".join(errors.keys()),
-            )
+            if errors:
+                log.warning(
+                    "Watch %s dashboard updated: %s successful dates, %s errors (%s)",
+                    watch.id,
+                    len(results),
+                    len(errors),
+                    ", ".join(errors.keys()),
+                )
+            else:
+                log.info(
+                    "Watch %s dashboard updated: %s dates in %.1fs",
+                    watch.id,
+                    len(results),
+                    elapsed,
+                )
         else:
-            log.info(
-                "Watch %s completed: %s dates checked in %.1fs",
-                watch.id,
-                len(results),
-                elapsed,
-            )
-
-        # Only raise a watch-level warning when every date failed.
-        if not results:
             count, last_notified = storage.record_error(watch.id)
             now = time.time()
             if count >= 3 and (
-                not last_notified
-                or now - last_notified > 6 * 3600
+                not last_notified or now - last_notified > 6 * 3600
             ):
-                await app.bot.send_message(
-                    chat_id=watch.chat_id,
-                    text=(
-                        f"⚠️ پایش #{watch.id} چند بار پشت‌سرهم نتوانست "
-                        "هیچ‌کدام از تاریخ‌های بازه را از سایت رجا بخواند.\n"
-                        "پایش متوقف نشده و دوباره تلاش می‌کند."
-                    ),
-                )
-                storage.mark_error_notified(watch.id)
+                try:
+                    await app.bot.send_message(
+                        chat_id=watch.chat_id,
+                        text=(
+                            f"⚠️ پایش #{watch.id} چند بار پشت‌سرهم نتوانست "
+                            "هیچ‌کدام از تاریخ‌های بازه را از سایت رجا بخواند.\n"
+                            "پایش متوقف نشده و دوباره تلاش می‌کند."
+                        ),
+                    )
+                    storage.mark_error_notified(watch.id)
+                except Exception:
+                    log.exception(
+                        "Could not send watch %s failure notification",
+                        watch.id,
+                    )
 
     except Exception:
-        log.exception("Watch %s cycle failed", watch.id)
-
+        log.exception("Unexpected watch %s cycle failure", watch.id)
         count, last_notified = storage.record_error(watch.id)
         now = time.time()
         if count >= 3 and (
-            not last_notified
-            or now - last_notified > 6 * 3600
+            not last_notified or now - last_notified > 6 * 3600
         ):
             try:
                 await app.bot.send_message(
                     chat_id=watch.chat_id,
                     text=(
-                        f"⚠️ پایش #{watch.id} چند بار پشت‌سرهم با خطای کلی "
-                        "مواجه شد. پایش متوقف نشده و دوباره تلاش می‌کند."
+                        f"⚠️ پایش #{watch.id} چند بار پشت‌سرهم خطا داده است.\n"
+                        "پایش متوقف نشده و دوباره تلاش می‌کند."
                     ),
                 )
                 storage.mark_error_notified(watch.id)
             except Exception:
                 log.exception(
-                    "Could not send watch %s failure notification",
+                    "Could not send watch %s cycle-error notification",
                     watch.id,
                 )
 
     finally:
-        # Target: one cycle start every interval. If the scan itself takes
-        # longer than the interval, start the next one shortly after this one.
+        # Target: start a new cycle roughly every configured interval.
+        # If scanning itself takes longer than the interval, retry shortly after
+        # the previous scan finishes instead of running overlapping scans.
         next_at = max(
             time.time() + 3,
             cycle_started_wall + max(60, watch.interval_seconds),
