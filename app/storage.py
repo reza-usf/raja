@@ -23,6 +23,7 @@ class Watch:
     last_fingerprint: str | None
     consecutive_errors: int
     last_error_notified_at: float | None
+    dashboard_message_id: int | None
 
 
 class Storage:
@@ -62,6 +63,38 @@ class Storage:
             )
             con.execute("CREATE INDEX IF NOT EXISTS idx_watches_due ON watches(active, next_check_at)")
             con.execute("CREATE INDEX IF NOT EXISTS idx_watches_chat ON watches(chat_id, active)")
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS watch_date_state (
+                    watch_id INTEGER NOT NULL,
+                    jalali_date TEXT NOT NULL,
+                    fingerprint TEXT,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (watch_id, jalali_date)
+                )
+                """
+            )
+            # Safe schema migration for dashboard support.
+            columns = {
+                row["name"]
+                for row in con.execute("PRAGMA table_info(watches)").fetchall()
+            }
+            if "dashboard_message_id" not in columns:
+                con.execute(
+                    "ALTER TABLE watches ADD COLUMN dashboard_message_id INTEGER"
+                )
+
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS watch_date_snapshot (
+                    watch_id INTEGER NOT NULL,
+                    jalali_date TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (watch_id, jalali_date)
+                )
+                """
+            )
 
     @staticmethod
     def _row_to_watch(row: sqlite3.Row) -> Watch:
@@ -80,6 +113,7 @@ class Storage:
             last_fingerprint=row["last_fingerprint"],
             consecutive_errors=row["consecutive_errors"],
             last_error_notified_at=row["last_error_notified_at"],
+            dashboard_message_id=row["dashboard_message_id"],
         )
 
     def add_watch(
@@ -159,6 +193,99 @@ class Storage:
             con.execute(
                 "UPDATE watches SET last_error_notified_at=? WHERE id=?",
                 (time.time(), watch_id),
+            )
+
+    def schedule_at(self, watch_id: int, timestamp: float):
+        with self._lock, self._connect() as con:
+            con.execute(
+                "UPDATE watches SET next_check_at=? WHERE id=?",
+                (timestamp, watch_id),
+            )
+
+    def get_date_fingerprint(self, watch_id: int, jalali_date: str) -> str | None:
+        with self._lock, self._connect() as con:
+            row = con.execute(
+                """
+                SELECT fingerprint
+                FROM watch_date_state
+                WHERE watch_id=? AND jalali_date=?
+                """,
+                (watch_id, jalali_date),
+            ).fetchone()
+            return row["fingerprint"] if row else None
+
+    def set_date_fingerprint(
+        self, watch_id: int, jalali_date: str, fingerprint: str | None
+    ):
+        with self._lock, self._connect() as con:
+            con.execute(
+                """
+                INSERT INTO watch_date_state
+                    (watch_id, jalali_date, fingerprint, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(watch_id, jalali_date)
+                DO UPDATE SET
+                    fingerprint=excluded.fingerprint,
+                    updated_at=excluded.updated_at
+                """,
+                (watch_id, jalali_date, fingerprint, time.time()),
+            )
+
+    def clear_errors(self, watch_id: int):
+        with self._lock, self._connect() as con:
+            con.execute(
+                """
+                UPDATE watches
+                SET consecutive_errors=0, last_error_notified_at=NULL
+                WHERE id=?
+                """,
+                (watch_id,),
+            )
+
+    def set_dashboard_message_id(self, watch_id: int, message_id: int | None):
+        with self._lock, self._connect() as con:
+            con.execute(
+                "UPDATE watches SET dashboard_message_id=? WHERE id=?",
+                (message_id, watch_id),
+            )
+
+    def get_date_snapshot(self, watch_id: int, jalali_date: str) -> dict | None:
+        import json
+
+        with self._lock, self._connect() as con:
+            row = con.execute(
+                """
+                SELECT snapshot_json
+                FROM watch_date_snapshot
+                WHERE watch_id=? AND jalali_date=?
+                """,
+                (watch_id, jalali_date),
+            ).fetchone()
+
+        if not row:
+            return None
+
+        try:
+            return json.loads(row["snapshot_json"])
+        except Exception:
+            return None
+
+    def set_date_snapshot(self, watch_id: int, jalali_date: str, snapshot: dict):
+        import json
+
+        payload = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+        with self._lock, self._connect() as con:
+            con.execute(
+                """
+                INSERT INTO watch_date_snapshot
+                    (watch_id, jalali_date, snapshot_json, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(watch_id, jalali_date)
+                DO UPDATE SET
+                    snapshot_json=excluded.snapshot_json,
+                    updated_at=excluded.updated_at
+                """,
+                (watch_id, jalali_date, payload, time.time()),
             )
 
     def deactivate(self, watch_id: int, chat_id: int) -> bool:

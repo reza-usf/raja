@@ -6,6 +6,8 @@ import logging
 import random
 import re
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -22,12 +24,37 @@ from .config import Settings
 from .date_utils import current_jalali_year, format_jalali, iter_jalali_days, parse_jalali_date
 from .raja import RajaScraper
 from .storage import Storage, Watch
+from .status_logic import detect_important_events, render_dashboard
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+_SECRET_URL_RE = re.compile(
+    r"(https?://tapi\.bale\.ai/(?:file/)?bot)[^/\s]+",
+    re.IGNORECASE,
 )
+
+
+class SecretRedactingFormatter(logging.Formatter):
+    def format(self, record):
+        rendered = super().format(record)
+        return _SECRET_URL_RE.sub(r"\1<redacted>", rendered)
+
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(
+    SecretRedactingFormatter(
+        "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    )
+)
+_root_logger = logging.getLogger()
+_root_logger.handlers.clear()
+_root_logger.addHandler(_handler)
+_root_logger.setLevel(logging.INFO)
+
+# Routine HTTP request logs include the full Bot API URL. Hide them completely;
+# actual errors are still logged by our application with token redaction.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 log = logging.getLogger("raja-bot")
 
 ORIGIN, DESTINATION, DATE_FROM, DATE_TO, PASSENGERS, PASSENGER_TYPE, CONFIRM = range(7)
@@ -49,7 +76,7 @@ def main_menu():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "سلام. این بات ظرفیت بلیت قطار رجا را فقط پایش می‌کند و خرید خودکار انجام نمی‌دهد.\n\n"
+        "سلام. این بازو ظرفیت بلیت قطار رجا را فقط پایش می‌کند و خرید خودکار انجام نمی‌دهد.\n\n"
         "برای ساخت پایش جدید، مبدا، مقصد، بازه تاریخ شمسی، تعداد مسافر و نوع مسافر را می‌گیریم."
     )
     await update.message.reply_text(text, reply_markup=main_menu())
@@ -164,7 +191,7 @@ async def confirm_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         interval_seconds=settings.check_interval_seconds,
     )
     await q.message.reply_text(
-        f"✅ پایش #{watch_id} فعال شد. اگر ظرفیت تازه‌ای دیده شود همین‌جا خبر می‌دهم.",
+        f"✅ پایش #{watch_id} فعال شد. وضعیت همه تاریخ‌ها در یک پیام زنده به‌روزرسانی می‌شود و فقط تغییرات مهم اعلان جداگانه می‌گیرند.",
         reply_markup=main_menu(),
     )
     context.user_data.pop("draft", None)
@@ -214,75 +241,245 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-def aggregate_fingerprint(results) -> str | None:
-    available = [r for r in results if r.available]
-    if not available:
-        return None
-    material = "|".join(sorted(f"{r.date}:{r.fingerprint}" for r in available))
-    return hashlib.sha256(material.encode()).hexdigest()
+async def _ensure_dashboard_message(
+    app: Application,
+    storage: Storage,
+    watch: Watch,
+    text: str,
+) -> int:
+    """
+    Return a reusable Dashboard message id.
+
+    Existing watches created before this version do not have one. In that case
+    the bot sends it once and stores its message_id. Normal refreshes edit this
+    same message and therefore do not create a new notification.
+    """
+    if watch.dashboard_message_id:
+        return watch.dashboard_message_id
+
+    msg = await app.bot.send_message(
+        chat_id=watch.chat_id,
+        text=text,
+    )
+    storage.set_dashboard_message_id(watch.id, msg.message_id)
+    return msg.message_id
 
 
-def format_alert(watch: Watch, results) -> str:
-    found = [r for r in results if r.available]
-    lines = [
-        "🚨 ظرفیت بلیت پیدا شد",
-        f"🚉 {watch.origin} → {watch.destination}",
-        f"👥 {watch.passengers} نفر | {TYPE_LABELS[watch.passenger_type]}",
-        "",
-    ]
-    for result in found[:8]:
-        lines.append(f"📅 {result.date}")
-        for detail in result.details[:3]:
-            clean = re.sub(r"\s+", " ", detail).strip()
-            if clean:
-                lines.append(f"• {clean[:250]}")
-    lines += ["", "برای خرید، سریع وارد سایت رسمی رجا شو:", "https://www.raja.ir/"]
-    return "\n".join(lines)
+async def _update_dashboard(
+    app: Application,
+    storage: Storage,
+    watch: Watch,
+    text: str,
+) -> int:
+    message_id = await _ensure_dashboard_message(
+        app, storage, watch, text
+    )
+
+    # If it was just created, it already contains the current text.
+    if not watch.dashboard_message_id:
+        return message_id
+
+    try:
+        await app.bot.edit_message_text(
+            chat_id=watch.chat_id,
+            message_id=message_id,
+            text=text,
+        )
+        return message_id
+    except Exception as exc:
+        msg = str(exc).lower()
+
+        # Some Bot API implementations reject a byte-for-byte identical edit.
+        # This is harmless.
+        if "message is not modified" in msg:
+            return message_id
+
+        # If the user deleted the dashboard or Bale can no longer edit it,
+        # create a fresh dashboard and remember the new message id.
+        log.warning(
+            "Dashboard edit failed for watch %s; creating a new dashboard: %s",
+            watch.id,
+            exc,
+        )
+        new_msg = await app.bot.send_message(
+            chat_id=watch.chat_id,
+            text=text,
+        )
+        storage.set_dashboard_message_id(watch.id, new_msg.message_id)
+        return new_msg.message_id
+
+
+def _iran_now() -> datetime:
+    try:
+        return datetime.now(ZoneInfo("Asia/Tehran"))
+    except Exception:
+        return datetime.now()
 
 
 async def check_one_watch(app: Application, watch: Watch):
     storage: Storage = app.bot_data["storage"]
     scraper: RajaScraper = app.bot_data["scraper"]
-    results = []
+
+    cycle_started_wall = time.time()
+    cycle_started_mono = time.monotonic()
+
+    dates = [
+        format_jalali(day)
+        for day in iter_jalali_days(watch.date_from, watch.date_to)
+    ]
 
     try:
-        for day in iter_jalali_days(watch.date_from, watch.date_to):
-            result = await scraper.check_date(
-                origin=watch.origin,
-                destination=watch.destination,
-                jalali_date=format_jalali(day),
-                passengers=watch.passengers,
-                passenger_type=watch.passenger_type,
-            )
-            results.append(result)
-            await asyncio.sleep(0.8 + random.random() * 0.8)
+        results, errors = await scraper.check_dates(
+            origin=watch.origin,
+            destination=watch.destination,
+            jalali_dates=dates,
+            passengers=watch.passengers,
+            passenger_type=watch.passenger_type,
+        )
 
-        fp = aggregate_fingerprint(results)
-        if fp and fp != watch.last_fingerprint:
+        current_snapshots: dict[str, dict] = {}
+        important_events = []
+
+        # Compare every successfully-read date with the last successful state.
+        for jalali_date, result in results.items():
+            current = result.snapshot()
+            previous = storage.get_date_snapshot(
+                watch.id, jalali_date
+            )
+            current_snapshots[jalali_date] = current
+
+            important_events.extend(
+                detect_important_events(
+                    jalali_date,
+                    previous,
+                    current,
+                )
+            )
+
+        elapsed = time.monotonic() - cycle_started_mono
+
+        dashboard_text = render_dashboard(
+            watch_id=watch.id,
+            origin=watch.origin,
+            destination=watch.destination,
+            passengers=watch.passengers,
+            passenger_type_label=TYPE_LABELS[watch.passenger_type],
+            dates=dates,
+            snapshots=current_snapshots,
+            errors=errors,
+            checked_at=_iran_now(),
+            scan_seconds=elapsed,
+        )
+
+        # Ordinary status refresh: edit the same message, no new-message alert.
+        await _update_dashboard(
+            app,
+            storage,
+            watch,
+            dashboard_text,
+        )
+
+        # Important changes: send ONE new message for the whole cycle.
+        # This is the notification-producing path.
+        if important_events:
+            lines = [
+                f"🔔 تغییر مهم در پایش #{watch.id}",
+                f"🚉 {watch.origin} → {watch.destination}",
+                "",
+            ]
+            lines.extend(
+                f"• {event.text}"
+                for event in important_events[:12]
+            )
+            if len(important_events) > 12:
+                lines.append(
+                    f"• ... و {len(important_events) - 12} تغییر دیگر"
+                )
+
             await app.bot.send_message(
                 chat_id=watch.chat_id,
-                text=format_alert(watch, results),
-                disable_web_page_preview=True,
+                text="\n".join(lines),
             )
 
-        storage.set_fingerprint(watch.id, fp)
+        # Commit snapshots only after Dashboard + important notification have
+        # completed successfully. If Bale temporarily fails, the next cycle can
+        # retry the important notification instead of silently losing it.
+        for jalali_date, current in current_snapshots.items():
+            storage.set_date_snapshot(
+                watch.id,
+                jalali_date,
+                current,
+            )
+
+        if results:
+            storage.clear_errors(watch.id)
+
+        if errors:
+            log.warning(
+                "Watch %s: %s successful dates, %s failed dates (%s)",
+                watch.id,
+                len(results),
+                len(errors),
+                ", ".join(errors.keys()),
+            )
+        else:
+            log.info(
+                "Watch %s completed: %s dates checked in %.1fs",
+                watch.id,
+                len(results),
+                elapsed,
+            )
+
+        # Only raise a watch-level warning when every date failed.
+        if not results:
+            count, last_notified = storage.record_error(watch.id)
+            now = time.time()
+            if count >= 3 and (
+                not last_notified
+                or now - last_notified > 6 * 3600
+            ):
+                await app.bot.send_message(
+                    chat_id=watch.chat_id,
+                    text=(
+                        f"⚠️ پایش #{watch.id} چند بار پشت‌سرهم نتوانست "
+                        "هیچ‌کدام از تاریخ‌های بازه را از سایت رجا بخواند.\n"
+                        "پایش متوقف نشده و دوباره تلاش می‌کند."
+                    ),
+                )
+                storage.mark_error_notified(watch.id)
 
     except Exception:
-        log.exception("Watch %s failed", watch.id)
+        log.exception("Watch %s cycle failed", watch.id)
+
         count, last_notified = storage.record_error(watch.id)
         now = time.time()
-        if count >= 3 and (not last_notified or now - last_notified > 6 * 3600):
-            await app.bot.send_message(
-                chat_id=watch.chat_id,
-                text=(
-                    f"⚠️ پایش #{watch.id} چند بار پشت‌سرهم نتوانست سایت رجا را بخواند.\n"
-                    "احتمالاً ظاهر سایت تغییر کرده یا دسترسی موقتاً محدود شده است. "
-                    "پایش متوقف نشده و دوباره تلاش می‌کند."
-                ),
-            )
-            storage.mark_error_notified(watch.id)
+        if count >= 3 and (
+            not last_notified
+            or now - last_notified > 6 * 3600
+        ):
+            try:
+                await app.bot.send_message(
+                    chat_id=watch.chat_id,
+                    text=(
+                        f"⚠️ پایش #{watch.id} چند بار پشت‌سرهم با خطای کلی "
+                        "مواجه شد. پایش متوقف نشده و دوباره تلاش می‌کند."
+                    ),
+                )
+                storage.mark_error_notified(watch.id)
+            except Exception:
+                log.exception(
+                    "Could not send watch %s failure notification",
+                    watch.id,
+                )
+
     finally:
-        storage.schedule_next(watch.id, watch.interval_seconds)
+        # Target: one cycle start every interval. If the scan itself takes
+        # longer than the interval, start the next one shortly after this one.
+        next_at = max(
+            time.time() + 3,
+            cycle_started_wall + max(60, watch.interval_seconds),
+        )
+        storage.schedule_at(watch.id, next_at)
 
 
 async def worker(app: Application):
@@ -319,7 +516,9 @@ def build_app() -> Application:
 
     app = (
         Application.builder()
-        .token(settings.telegram_bot_token)
+        .token(settings.bale_bot_token)
+        .base_url("https://tapi.bale.ai/bot")
+        .base_file_url("https://tapi.bale.ai/file/bot")
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
@@ -351,7 +550,7 @@ def build_app() -> Application:
 
 def main():
     app = build_app()
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling()
 
 
 if __name__ == "__main__":
